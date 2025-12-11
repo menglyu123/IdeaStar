@@ -1,5 +1,4 @@
 # app.py
-import os
 import pathlib
 import typing
 import time
@@ -21,8 +20,8 @@ import huggingface_hub
 
 # ------------------- Config -------------------
 API_KEY = os.environ.get(HUGGING_FACE_KEY)
-DATA_DIR = pathlib.Path("./data")
-CHROMA_DIR = "./chromaDB"
+DATA_DIR = pathlib.Path("/tmp/URA/data")
+CHROMA_DIR = "/tmp/URA/chromaDB"
 COLLECTION = "real_docs"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"   # fast, permissive
 SYSTEM_PROMPT = """You are a research scholar. Your job is to come up with a novel research topic that aligns with the query question.
@@ -101,7 +100,6 @@ def load_file(path: pathlib.Path) -> typing.Optional[RawDoc]:
    text = " ".join(text.split())
    if not text.strip():
        return None
-
    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime)
    title = path.stem.replace("_", " ").strip() or path.name
    return RawDoc(
@@ -292,15 +290,18 @@ with st.sidebar:
 
 
 # Upload files
-st.subheader("Upload documents")
+st.subheader(f"Connect to corpus directory")
+
 uploaded = st.file_uploader(
     "Add PDFs, DOCX, HTML, MD, or TXT",
     type=["pdf", "docx", "html", "htm", "md", "markdown", "txt"],
-    accept_multiple_files=True,
+    accept_multiple_files='directory',
 )
+
 if uploaded:
     for f in uploaded:
         dest = DATA_DIR / f.name
+        dest.parent.mkdir(parents=True, exist_ok=True) 
         with open(dest, "wb") as out:
             out.write(f.read())
     st.success(f"Uploaded {len(uploaded)} file(s) to {DATA_DIR.resolve()}")
@@ -314,7 +315,7 @@ if files:
         stat = p.stat()
         st.caption(f"• {p.name} — {p.suffix[1:].lower()} — {dt.datetime.fromtimestamp(stat.st_mtime)}")
 else:
-    st.info("No files yet. Upload above or place files in ./data")
+    st.info("No files yet. Upload above or place files")
 
 # Indexing
 embedder = get_embedder()

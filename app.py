@@ -235,8 +235,7 @@ def build_prompt(question: str, hits: typing.List[typing.Dict]) -> str:
                    3. Thirdly, formulate research questions. Develop specific topics based on the gaps or themes identified. Ensure these topics offer fresh perspectives or new insights. They should be clear, focused, and researchable.
                    4. Make sure the scope is neither too broad nor too narrow. The research topics should connect with existing theories or models which provide foundations for the research.
                """
-#                - Rely strictly on the context.
-#                - Cite (title → file path) after each factual claim.
+
 def generate(prompt: str, temperature: float = 0.2) -> str:
    try:
        client = huggingface_hub.InferenceClient(
@@ -336,15 +335,12 @@ if reindex_btn:
 
 st.markdown("---")
 st.header("Ask your corpus")
-q = st.text_input("Question", placeholder="e.g., What are our warranty terms for frames and forks?")
-ask_col1, ask_col2 = st.columns([1, 3])
-with ask_col1:
-    ask_btn = st.button("Ask")
-with ask_col2:
+q = st.text_input("Question", placeholder="e.g., Give me a topic about ai development?")
+
+if q.strip():
     filt_dict = {"filetype": filt} if filt else None
     st.caption(f"Filter: {filt_dict if filt_dict else 'None'} • Top-K: {top_k} • Temp: {temperature}")
 
-if ask_btn and q.strip():
     with st.spinner("Retrieving relevant chunks…"):
         hits = retrieve(q, embedder, k=top_k, where=filt_dict)
     if not hits:
@@ -364,6 +360,13 @@ if ask_btn and q.strip():
 
     st.subheader("Answer")
     st.write(answer)
+    st.download_button(
+    label="Download Answer", # The button's label
+    data=answer , # The data to be downloaded
+    file_name="URA-answer.txt", # The desired filename for the downloaded file
+    mime ="text/plain",
+)              
+
   
 
 # if __name__ == "__main__":

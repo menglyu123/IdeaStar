@@ -31,11 +31,14 @@ for _sig_name in ("SIGTERM", "SIGINT", "SIGHUP"):
 
 
 # ------------------- Config -------------------
-API_KEY = os.environ.get(HUGGING_FACE_KEY)
+HUGGING_FACE_KEY = os.environ.get(HUGGING_FACE_KEY)
+FIRECRAWL_API_KEY = os.environ.get(FIRECRAWL_API_KEY)
+SERP_API_KEY = os.environl.get(SERP_API_KEY)
+
 DATA_DIR = pathlib.Path("/tmp/IdeaStar/data")
 CHROMA_DIR = "/tmp/IdeaStar/chromaDB"
 COLLECTION = "real_docs"
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"   # fast, permissive
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 SYSTEM_PROMPT = """You are a research scholar. Your job is to do academic research tasks regarding the query question.
 """
 
@@ -299,7 +302,7 @@ def generate(prompt: str, temperature: float = 0.2) -> str:
        import huggingface_hub
        client = huggingface_hub.InferenceClient(
            provider="nscale",
-           api_key=API_KEY,
+           api_key=HUGGING_FACE_KEY,
            )
 
        resp = client.chat.completions.create(
@@ -464,8 +467,8 @@ if ask_direct_btn and q.strip():
         with st.spinner("Searching literatures …"):
             import firecrawl
             import serpapi
-            app = firecrawl.Firecrawl(api_key="fc-29a8965eb2bb4395915aaa9206e507c6")
-            client = serpapi.Client(api_key="15e30ce30199c5d1878a249a8011690e212dcfa967ffe08317455a1475d7bada")
+            app = firecrawl.Firecrawl(api_key=FIRECRAWL_API_KEY)
+            client = serpapi.Client(api_key=SERP_API_KEY)
             search_results = client.search({
             "engine": "google_scholar",
             "q": f"recent 5 years research papers on {keythemes}",

@@ -6,3 +6,5 @@ pypdf
 chromadb
 sentence-transformers
 huggingface_hub
+serpapi
+firecrawl-py

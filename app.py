@@ -1,8 +1,11 @@
 # app.py
-import pathlib
+import pathlib, shutil
 import typing
 import time
 import datetime as dt
+import subprocess
+import os
+import signal
 import streamlit as st
 import dataclasses
 
@@ -12,26 +15,29 @@ import bs4
 import markdown as md
 import pypdf
 
-# --- vector + llm ---
-import chromadb
-import sentence_transformers
-import huggingface_hub
+
+def _force_quit(_signum, _frame):
+   # In packaged desktop mode, close-window events can leave worker threads running.
+   # Force process exit so the app quits when macOS requests termination.
+   os._exit(0)
+for _sig_name in ("SIGTERM", "SIGINT", "SIGHUP"):
+   _sig = getattr(signal, _sig_name, None)
+   if _sig is not None:
+       try:
+           signal.signal(_sig, _force_quit)
+       except Exception:
+           pass
+       
 
 
 # ------------------- Config -------------------
 API_KEY = os.environ.get(HUGGING_FACE_KEY)
-DATA_DIR = pathlib.Path("/tmp/URA/data")
-CHROMA_DIR = "/tmp/URA/chromaDB"
+DATA_DIR = pathlib.Path("/tmp/IdeaStar/data")
+CHROMA_DIR = "/tmp/IdeaStar/chromaDB"
 COLLECTION = "real_docs"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"   # fast, permissive
-SYSTEM_PROMPT = """You are a research scholar. Your job is to come up with a novel research topic that aligns with the query question.
+SYSTEM_PROMPT = """You are a research scholar. Your job is to do academic research tasks regarding the query question.
 """
-
-
-#"""You are a careful, grounded assistant.
-# Use ONLY the provided context to answer the question.
-# If the answer is not supported by the context, say you don't know.
-# Include brief citations in the form (title → file path)."""
 
 
 # ------------------- Data model -------------------
@@ -43,6 +49,7 @@ class RawDoc:
    path: str
    mtime_iso: str
    filetype: str
+
 
 # ------------------- Utilities: loaders -------------------
 def read_text_txt(path: pathlib.Path) -> str:
@@ -119,6 +126,7 @@ def walk_data_dir(data_dir: pathlib.Path) -> typing.List[RawDoc]:
            docs.append(rd)
    return docs
 
+
 # -------------------- Chunk: overlapped chunk ---------------------
 def chunk_text(text: str, max_chars: int, overlap: int) -> typing.List[str]:
    chunks = []
@@ -134,13 +142,15 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> typing.List[str]:
            start = max(0, end - overlap)
    return chunks
 
+
 # ------------------- Embedding + Chroma -------------------
 @st.cache_resource
 def get_embedder():
+   import sentence_transformers
    return sentence_transformers.SentenceTransformer(EMBEDDING_MODEL)
 
-@st.cache_resource
 def get_collection():
+   import chromadb
    client = chromadb.PersistentClient(
        path=CHROMA_DIR,
        settings=chromadb.config.Settings(anonymized_telemetry=False),
@@ -150,8 +160,20 @@ def get_collection():
    except Exception:
        return client.create_collection(COLLECTION)
 
+def initialize_collection():
+    import chromadb
+    client = chromadb.PersistentClient(
+       path=CHROMA_DIR,
+       settings=chromadb.config.Settings(anonymized_telemetry=False),
+    )
+    try:
+       client.delete_collection(COLLECTION)  # removes all stored items
+    except Exception:
+       pass
+    return client.create_collection(COLLECTION)
+
 def index_docs(docs: typing.List[RawDoc], embedder, max_chars: int, overlap: int):
-   coll = get_collection()
+   coll = initialize_collection()
    ids, docs_text, metas = [], [], []
 
    for rd in docs:
@@ -192,6 +214,41 @@ def touch_index_marker():
    marker.parent.mkdir(parents=True, exist_ok=True)
    marker.write_text(str(time.time()))
 
+def copy_answer_to_clipboard(answer: str) -> typing.Tuple[bool, str]:
+   # PyInstaller apps may launch without UTF-8 locale; force it for clipboard tools.
+   clip_env = dict(os.environ)
+   clip_env["LANG"] = "en_US.UTF-8"
+   clip_env["LC_ALL"] = "en_US.UTF-8"
+   clip_env["LC_CTYPE"] = "UTF-8"
+
+   try:
+       proc = subprocess.run(
+           ["pbcopy"],
+           input=answer.encode("utf-8"),
+           stdout=subprocess.DEVNULL,
+           stderr=subprocess.PIPE,
+           env=clip_env,
+           check=False,
+       )
+       if proc.returncode == 0:
+           return True, "Copied answer to clipboard."
+       err = proc.stderr.decode("utf-8", errors="ignore").strip() or "unknown pbcopy error"
+       # Fallback to AppleScript clipboard assignment when pbcopy fails in packaged apps.
+       osa = subprocess.run(
+           ["osascript", "-e", "set the clipboard to (read (POSIX file \"/dev/stdin\") as «class utf8»)"],
+           input=answer.encode("utf-8"),
+           stdout=subprocess.DEVNULL,
+           stderr=subprocess.PIPE,
+           env=clip_env,
+           check=False,
+       )
+       if osa.returncode == 0:
+           return True, "Copied answer to clipboard."
+       osa_err = osa.stderr.decode("utf-8", errors="ignore").strip() or err
+       return False, f"Clipboard copy failed: {osa_err}"
+   except Exception as e:
+       return False, f"Clipboard copy failed: {e}"
+
 
 # ------------------- Retrieval + LLM -------------------
 def retrieve(question: str, embedder, k: int = 5, where: typing.Optional[typing.Dict]=None) -> typing.List[typing.Dict]:
@@ -230,14 +287,16 @@ def build_prompt(question: str, hits: typing.List[typing.Dict]) -> str:
                {question}
               
                # Answering rules
-                   1. First, do the literature review. Look for gaps, under-explored research areas.
-                   2. Second, identify key themes. Focus on topics that align with the goals and pay attention to recurring themes, particular aspects, methodologies across different studies.
-                   3. Thirdly, formulate research questions. Develop specific topics based on the gaps or themes identified. Ensure these topics offer fresh perspectives or new insights. They should be clear, focused, and researchable.
-                   4. Make sure the scope is neither too broad nor too narrow. The research topics should connect with existing theories or models which provide foundations for the research.
-               """
+                    1. If the question is in Chinese, your answer must be in Chinese. If the question is not related to a research task, response by guiding user to ask a research task. Otherwise, do the following steps.
+                    2. First, do the literature review. Look for gaps, under-explored research areas.
+                    3. Second, identify key themes. Focus on topics that align with the goals and pay attention to recurring themes, particular aspects, methodologies across different studies.
+                    4. Thirdly, formulate research questions. Develop specific topics based on the gaps or themes identified. Ensure these topics offer fresh perspectives or new insights. They should be clear, focused, and researchable.
+                    5. Make sure the scope is neither too broad nor too narrow. The research topics should connect with existing theories or models which provide foundations for the research.
+                """
 
 def generate(prompt: str, temperature: float = 0.2) -> str:
    try:
+       import huggingface_hub
        client = huggingface_hub.InferenceClient(
            provider="nscale",
            api_key=API_KEY,
@@ -267,16 +326,23 @@ def generate(prompt: str, temperature: float = 0.2) -> str:
    except Exception as e:
        return f"[ERROR calling hugging face llm] {e}"
   
-  
+if "reindex_needed" not in st.session_state:
+    st.session_state.reindex_needed = False
+if "uploaded_signature" not in st.session_state:
+    st.session_state.uploaded_signature = None
+if "answer" not in st.session_state:
+    st.session_state.answer = ""
+
+
 # ------------------- UI -------------------
-st.set_page_config(page_title="RAG • ChromaDB + QWen 3 (4B)", layout="wide")
-st.title("RAG with ChromaDB + QWen 3 (4B)")
+st.set_page_config(page_title="IdeaStar", layout="wide")
+st.title("Your Topic Sage")
 
 # Ensure data dir exists
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 with st.sidebar:
-    st.header("Settings")
+    st.header("本地资料库索引设置")
     top_k = st.slider("Top-K (retrieval)", min_value=1, max_value=10, value=5, step=1)
     chunk_chars = st.slider("Chunk size (chars)", min_value=300, max_value=3000, value=1200, step=100)
     chunk_overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=600, value=150, step=10)
@@ -286,10 +352,8 @@ with st.sidebar:
     st.markdown("---")
     reindex_btn = st.button("(Re)Index")
 
-
-
 # Upload files
-st.subheader(f"Connect to corpus directory")
+st.subheader("连接本地资料库corpus")
 
 uploaded = st.file_uploader(
     "Add PDFs, DOCX, HTML, MD, or TXT",
@@ -297,19 +361,36 @@ uploaded = st.file_uploader(
     accept_multiple_files='directory',
 )
 
-if uploaded:
-    for f in uploaded:
-        dest = DATA_DIR / f.name
-        dest.parent.mkdir(parents=True, exist_ok=True) 
-        with open(dest, "wb") as out:
-            out.write(f.read())
-    st.success(f"Uploaded {len(uploaded)} file(s) to {DATA_DIR.resolve()}")
+current_signature = tuple(sorted((f.name, f.size) for f in uploaded)) if uploaded else ()
+
+# Streamlit reruns on every interaction; only rewrite DATA_DIR when uploads change.
+if current_signature != st.session_state.uploaded_signature:
+    if uploaded:
+        if DATA_DIR.exists():
+            shutil.rmtree(DATA_DIR)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Keep DATA_DIR aligned with the currently selected upload list.
+        for f in uploaded:
+            dest = DATA_DIR / f.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as out:
+                out.write(f.read())
+        st.success(f"Connected {len(uploaded)} file(s)")
+    elif st.session_state.uploaded_signature not in (None, ()):
+        # User removed all selected files; clear DATA_DIR as well.
+        if DATA_DIR.exists():
+            shutil.rmtree(DATA_DIR)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        st.info("All uploaded files removed.")
+
+    st.session_state.uploaded_signature = current_signature
 
 # List current files
-st.subheader("Current corpus")
+st.subheader("当前资料corpus")
 files = sorted([p for p in DATA_DIR.rglob("*") if p.is_file()])
 if files:
-    st.write(f"{len(files)} file(s) in {DATA_DIR}")
+    st.write(f"{len(files)} file(s)")
     for p in files[:50]:
         stat = p.stat()
         st.caption(f"• {p.name} — {p.suffix[1:].lower()} — {dt.datetime.fromtimestamp(stat.st_mtime)}")
@@ -321,68 +402,121 @@ embedder = get_embedder()
 docs = walk_data_dir(DATA_DIR)
 
 # Auto-index if needed or on button
-auto_needed = needs_reindex(docs)
-if auto_needed:
-    st.info("Index appears stale or missing. Click (Re)Index to build.")
+st.session_state.reindex_needed = needs_reindex(docs)
+
 if reindex_btn:
+    st.session_state.reindex_needed = False
     if not docs:
         st.warning("No supported documents found to index.")
     else:
         with st.spinner("Indexing… this can take a minute on first run (downloading embedding model)."):
+            embedder = get_embedder()
             n_chunks = index_docs(docs, embedder, max_chars=chunk_chars, overlap=chunk_overlap)
             touch_index_marker()
-        st.success(f"Indexed {n_chunks} chunk(s) into Chroma at {CHROMA_DIR}")
+        st.success(f"Indexed {n_chunks} chunk(s)")
+
+if st.session_state.reindex_needed:
+    st.info("Index appears stale or missing. Click (Re)Index in the sidebar to build.")
 
 st.markdown("---")
-st.header("Ask your corpus")
+st.header("Ask")
 q = st.text_input("Question", placeholder="e.g., Give me a topic about ai development?")
+col1, col2 = st.columns(2)
+with col1:
+    ask_btn = st.button("Ask with corpus")
+with col2:
+    ask_direct_btn = st.button("Ask without corpus")
 
-if q.strip():
+
+if ask_btn and q.strip(): 
+    if st.session_state.reindex_needed:
+        st.info("Index appears stale or missing. Click (Re)Index in the sidebar to build.")
+    else:
+        embedder = get_embedder()
+        filt_dict = {"filetype": filt} if filt else None
+        st.caption(f"Filter: {filt_dict if filt_dict else 'None'} • Top-K: {top_k} • Temp: {temperature}")
+        with st.spinner("Retrieving relevant chunks…"):
+            hits = retrieve(q, embedder, k=top_k, where=filt_dict)
+        if not hits:
+            st.warning("No relevant context found. Try re-indexing or broadening your query.")
+            st.stop()
+
+        st.subheader("Retrieved chunks")
+        for i, h in enumerate(hits, start=1):
+            m = h["metadata"]
+            with st.expander(f"{i}. {m['title']}  |  {m['filetype']}  |  distance-score={h['score']}", expanded=(i == 1)):
+                st.caption(f"last_modified={m['last_modified']}  •  chunk={m['chunk_index']}")
+                st.write(h["text"])
+
+        prompt = build_prompt(q, hits)
+        with st.spinner("Generating grounded answer …"):
+            answer = generate(prompt, temperature=temperature)
+        st.session_state.answer = answer
+
+
+if ask_direct_btn and q.strip():
     filt_dict = {"filetype": filt} if filt else None
     st.caption(f"Filter: {filt_dict if filt_dict else 'None'} • Top-K: {top_k} • Temp: {temperature}")
+    keythemes = generate(f'Query: {q}. If the query is not a research task, ONLY response by ##NONE##. If the query is a research task, identify the key research themes in the query, ONLY return them in English joined by ;.', temperature=temperature)
+    print('key themes: ', keythemes)
+    results = []
+    if keythemes.strip("#") != 'NONE':
+        with st.spinner("Searching literatures …"):
+            import firecrawl
+            import serpapi
+            app = firecrawl.Firecrawl(api_key="fc-29a8965eb2bb4395915aaa9206e507c6")
+            client = serpapi.Client(api_key="15e30ce30199c5d1878a249a8011690e212dcfa967ffe08317455a1475d7bada")
+            search_results = client.search({
+            "engine": "google_scholar",
+            "q": f"recent 5 years research papers on {keythemes}",
+            "num": 20,
+            "hl":"en",
+            })
+            for result in search_results.get("organic_results", []):
+                article_url = result.get("link") # This is the URL of the article
+                try:
+                    doc = app.scrape(article_url, timeout=2000)
+                except:
+                    continue
+                abstract = None
+                for sec in doc.markdown.split('##'):
+                    if sec.strip().lower().startswith('abstract'):
+                        abstract = sec
+                results.insert(0,{"title": result.get('title'), "abstract": abstract})
 
-    with st.spinner("Retrieving relevant chunks…"):
-        hits = retrieve(q, embedder, k=top_k, where=filt_dict)
-    if not hits:
-        st.warning("No relevant context found. Try re-indexing or broadening your query.")
-        st.stop()
+    ctx=[]
+    for paper in results:
+       ctx.append(
+           f"### {paper.get("title")}\n"
+           f"{paper.get("abstract")}"
+       )
+    context = "\n\n".join(ctx)
 
-    st.subheader("Retrieved chunks")
-    for i, h in enumerate(hits, start=1):
-        m = h["metadata"]
-        with st.expander(f"{i}. {m['title']}  |  {m['filetype']}  |  score={h['score']}", expanded=(i == 1)):
-            st.caption(f"{m['source_path']}  •  last_modified={m['last_modified']}  •  chunk={m['chunk_index']}")
-            st.write(h["text"])
+    prompt = f"""{SYSTEM_PROMPT}
 
-    prompt = build_prompt(q, hits)
+        # Context
+        {context}
+        
+        # Question
+        {q}
+        
+        # Answering rules
+            1. If the question is in Chinese, your answer must be in Chinese. If the question is not related to a research task, response by guiding user to ask a research task. Otherwise, do the following steps.
+            2. First, do the literature review. Look for gaps, under-explored research areas.
+            3. Second, identify key themes. Focus on topics that align with the goals and pay attention to recurring themes, particular aspects, methodologies across different studies.
+            4. Thirdly, formulate research questions. Develop specific topics based on the gaps or themes identified. Ensure these topics offer fresh perspectives or new insights. They should be clear, focused, and researchable.
+            5. Make sure the scope is neither too broad nor too narrow. The research topics should connect with existing theories or models which provide foundations for the research.
+        """
     with st.spinner("Generating grounded answer with QWen 3 (4B) …"):
         answer = generate(prompt, temperature=temperature)
+    st.session_state.answer = answer
 
-    st.subheader("Answer")
-    st.write(answer)
-    st.download_button(
-    label="Download Answer", # The button's label
-    data=answer , # The data to be downloaded
-    file_name="URA-answer.txt", # The desired filename for the downloaded file
-    mime ="text/plain",
-)              
-
-  
-
-# if __name__ == "__main__":
-#     doc = walk_data_dir(DATA_DIR)
-#     print("chunck finished!")
-#     tick1 = time()
-#     embedder = get_embedder()
-#     num_chunks = index_docs(docs = doc, embedder = embedder, max_chars=5000, overlap=100)
-#     tick2 = time()
-#     print("chromadb indexing finished! takes: ", tick2-tick1)
-#     question = "summarize the strategies trading ETF"
-#     hits = retrieve(question, embedder)
-#     tick3 = time()
-#     print("retrieve finished! takes: ", tick3-tick2)
-#     prompt = build_prompt(question, hits)
-#     answer = generate(prompt)
-#     tick4 = time()
-#     print("generate answer takes: ", tick4-tick3)
-#     print("answer: ", answer)
+if st.session_state.answer:
+    st.header("Answer")
+    st.write(st.session_state.answer)
+    if st.button("Copy Answer", key="copy_answer"):
+        ok, msg = copy_answer_to_clipboard(st.session_state.answer)
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)

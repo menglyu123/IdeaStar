@@ -31,7 +31,9 @@ IdeaStar/
 
 - Python 3.8+
 
-### 2. Install Dependencies
+## Installation
+
+### Install Dependencies
 
 ```bash
 pip install -r requirements.txt
